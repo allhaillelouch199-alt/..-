@@ -124,24 +124,44 @@ class UserbotManager:
         target_group_id = groups[0]["group_id"]
         if chat_id != target_group_id:
             return
-        # تجاهل الرسائل المرسلة من البوتات (شرط المستخدم)
+
+        # تجاهل الرسائل المرسلة من البوتات أو المحظورين
         try:
             sender = await event.get_sender()
             if sender and getattr(sender, "bot", False):
                 return
+            if sender and await db.is_blocked(sender.id):
+                return
         except Exception:
             pass
+
         text = event.raw_text or ""
         matches = CHANNEL_REGEX.findall(text)
         if not matches:
             return
+
         client = self.get_client(session_id)
         if not client:
             return
+
         for m in matches:
-            link = next((x for x in m if x), None)
-            if not link:
+            # m = (username, hash1, hash2)
+            username, h1, h2 = m[0], m[1], m[2]
+            if username:
+                link = "@" + username
+            elif h1:
+                if ("+" + h1) in text or ("joinchat/" + h1) in text:
+                    link = "https://t.me/+" + h1
+                else:
+                    link = h1
+            elif h2:
+                if ("+" + h2) in text or ("joinchat/" + h2) in text:
+                    link = "https://t.me/+" + h2
+                else:
+                    link = h2
+            else:
                 continue
+
             await self._join_and_schedule_leave(session_id, client, chat_id, link)
 
     async def _join_and_schedule_leave(self, session_id, client, chat_id, link):
@@ -150,7 +170,6 @@ class UserbotManager:
             await client.join_chat(link)
             joined = True
         except ChannelsTooMuchError:
-            # الحساب وصل للحد الأقصى → مغادرة 200 قناة والمحاولة مجددًا
             print(f"[Join] Channel limit reached. Leaving {CHANNEL_LIMIT_LEAVE_COUNT} channels...")
             await self._leave_oldest_channels(client, count=CHANNEL_LIMIT_LEAVE_COUNT)
             try:
@@ -183,8 +202,8 @@ class UserbotManager:
         try:
             dialogs = await client.get_dialogs(limit=None)
             channels = [d for d in dialogs if d.is_channel and not d.is_group]
-            # رتّب من الأقدم للأحدث
-            channels.sort(key=lambda d: d.date or datetime.min.replace(tzinfo=timezone.utc))
+            fallback = datetime.min.replace(tzinfo=timezone.utc)
+            channels.sort(key=lambda d: d.date or fallback)
             to_leave = channels[:count]
             left = 0
             for d in to_leave:
@@ -238,17 +257,28 @@ class UserbotManager:
             return ("error", str(e))
 
     async def _find_reply_target(self, client, group_id):
+        """يجد رسالة عضو بشري (غير محظور، غير بوت، ليس الحساب نفسه) ليرد عليها."""
         try:
             messages = await client.get_messages(group_id, limit=30)
             for msg in messages:
+                # تجاهل الرسائل الصادرة من الحساب نفسه
+                if getattr(msg, "out", False):
+                    continue
                 if not msg.from_id:
                     continue
                 try:
                     sender = await msg.get_sender()
                 except Exception:
                     continue
-                if sender and not getattr(sender, "bot", False):
-                    return msg.id
+                if not sender:
+                    continue
+                # تجاهل البوتات
+                if getattr(sender, "bot", False):
+                    continue
+                # تجاهل المحظورين
+                if await db.is_blocked(sender.id):
+                    continue
+                return msg.id
         except Exception:
             pass
         return None
