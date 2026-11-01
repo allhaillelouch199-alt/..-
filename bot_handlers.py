@@ -281,6 +281,8 @@ async def cb_bundle_interval(msg: Message, state: FSMContext):
 # ---------------- My bundles ----------------
 @router.callback_query(F.data == "my_bundles")
 async def cb_my_bundles(cb: CallbackQuery):
+    if not await check_access(cb.from_user.id):
+        await cb.answer("محظور", show_alert=True); return
     bundles = await db.get_user_bundles(cb.from_user.id)
     if not bundles:
         await cb.message.answer("📭 لا توجد مجموعات.")
@@ -303,7 +305,12 @@ async def cb_my_bundles(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("delb_"))
 async def cb_del_bundle(cb: CallbackQuery):
+    if not await check_access(cb.from_user.id):
+        await cb.answer("محظور", show_alert=True); return
     bid = int(cb.data.split("_")[1])
+    bundle = await db.get_bundle(bid)
+    if not bundle or bundle["user_id"] != cb.from_user.id:
+        await cb.answer("هذه المجموعة ليست لك.", show_alert=True); return
     scheduler_mgr.unschedule_bundle(bid)
     await db.delete_bundle(bid)
     await cb.message.edit_text(f"✅ تم حذف المجموعة #{bid}.")
