@@ -116,6 +116,9 @@ SETTINGS = {
     "leave_on_delete": ("1", "toggle", "🚪 مغادرة المجموعة عند حذفها من البوت"),
     "forced_on": ("1", "toggle", "📢 الانضمام التلقائي للقنوات الإجبارية"),
     "forced_leave_min": ("5", "int", "📢 مغادرة القناة الإجبارية بعد (دقيقة، 0 = لا يغادر)"),
+    "forced_max_h": ("12", "int", "📢 أقصى انضمام للقنوات الإجبارية بالساعة لكل حساب"),
+    "forced_gap_s": ("40", "int", "📢 أقل فاصل بين انضمامين (ثانية)"),
+    "forced_admins": ("0", "toggle", "📢 الانضمام للقنوات اللي يرسلها المشرفون (البوتات دائماً، الأعضاء مرفوضين)"),
 }
 
 
@@ -273,6 +276,10 @@ class Runner:
         self.last_kw = {}
         self.forced_seen = {}
         self.forced_lock = asyncio.Lock()
+        self.forced_pending = 0
+        self.forced_last = 0.0
+        self.forced_hist = []
+        self.manual_busy = 0
 
 
 RUNNERS = {}
@@ -526,8 +533,28 @@ async def forced_leave_later(r, ent, minutes):
         log.info("forced leave: %s", type(e).__name__)
 
 
+async def forced_allowed(r, ev):
+    """بوت = دائماً ينضم | مشرف = حسب إعداد المالك | عضو عادي = يتجاهل"""
+    snd = await ev.get_sender()
+    if getattr(snd, "bot", False):
+        return True
+    if not S("forced_admins"):
+        return False
+    if isinstance(snd, (types.Channel, types.Chat)):
+        return True  # مشرف مجهول أو رسالة بإسم القناة/المجموعة
+    try:
+        p = await r.client.get_permissions(ev.chat_id, ev.sender_id)
+        return bool(p.is_admin or p.is_creator)
+    except Exception:
+        return False
+
+
 async def forced_join(r, ev):
     try:
+        if r.manual_busy or r.forced_pending >= 5:
+            return
+        if not await forced_allowed(r, ev):
+            return
         refs = forced_refs(ev)
         if not refs:
             return
@@ -542,9 +569,20 @@ async def forced_join(r, ev):
             key = f"{kind}:{val.lower()}"
             if time.time() - r.forced_seen.get(key, 0) < keep * 60 + 120:
                 continue
+            if r.manual_busy or r.forced_pending >= 5:
+                return
             r.forced_seen[key] = time.time()
-            async with r.forced_lock:
-                await asyncio.sleep(random.uniform(2, 6))
+            r.forced_pending += 1
+            try:
+              async with r.forced_lock:
+                gap = max(0, S("forced_gap_s")) - (time.time() - r.forced_last)
+                await asyncio.sleep(max(0, gap) + random.uniform(2, 6))
+                r.forced_hist = [t for t in r.forced_hist if time.time() - t < 3600]
+                if r.manual_busy or len(r.forced_hist) >= S("forced_max_h"):
+                    r.forced_seen[key] = 0
+                    return
+                r.forced_hist.append(time.time())
+                r.forced_last = time.time()
                 try:
                     if kind == "invite":
                         ent = await join_invite(r, val)
@@ -562,6 +600,8 @@ async def forced_join(r, ev):
                     elif nm not in ("UsernameNotOccupiedError", "UsernameInvalidError", "ChannelPrivateError"):
                         await notify(f"⚠️ الحساب {r.phone}: تعذّر الانضمام للقناة الإجبارية {ref} ({nm})", f"fj{r.id}")
                     continue
+            finally:
+                r.forced_pending -= 1
             log.info("forced: %s joined %s", r.phone, getattr(ent, "title", val))
             if keep and ent is not None:
                 t = asyncio.create_task(forced_leave_later(r, ent, keep))
@@ -1249,6 +1289,8 @@ async def resolve_chat(r, ref):
 
 
 def err_text(e):
+    if type(e).__name__ == "FloodWaitError":
+        return f"تيليجرام حاظر الانضمام مؤقتاً، انتظر {getattr(e, 'seconds', '?')} ثانية"
     return str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {str(e)[:80]}"
 
 
@@ -1354,19 +1396,23 @@ async def on_text(ev):
         refs = [x for x in re.split(r"[\s,،]+", txt) if x][:20]
         await ev.respond(f"⏳ جاري المعالجة ({len(refs)})...")
         lines = []
+        r.manual_busy += 1
         for n, ref in enumerate(refs):
             try:
-                chat = await resolve_chat(r, ref)
+                chat = await asyncio.wait_for(resolve_chat(r, ref), 120)
                 ex("INSERT OR IGNORE INTO chats(account_id,chat_id,title) VALUES(?,?,?)",
                    st["acc"], utils.get_peer_id(chat), utils.get_display_name(chat))
                 warn = ""
                 if isinstance(chat, types.Channel) and chat.broadcast and not chat.megagroup:
                     warn = " ⚠️ قناة بث: لازم الحساب يكون مشرف حتى ينشر"
                 lines.append(f"✅ {utils.get_display_name(chat)}{warn}")
+            except asyncio.TimeoutError:
+                lines.append(f"❌ {ref}: انتهت المهلة (تيليجرام بطيء أو الحساب عليه ضغط)، جرب بعد دقيقة")
             except Exception as e:
                 lines.append(f"❌ {ref}: {err_text(e)}")
             if n < len(refs) - 1:
                 await asyncio.sleep(random.uniform(2, 4))
+        r.manual_busy = max(0, r.manual_busy - 1)
         STATE.pop(uid, None)
         return await ev.respond("\n".join(lines),
                                 buttons=[[B("📂 المجموعات", f"chats:{st['acc']}")], [B("🏠 القائمة", "main")]])
