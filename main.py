@@ -114,6 +114,8 @@ SETTINGS = {
     "pm_forward": ("1", "toggle", "📩 تحويل الرسائل الخاصة إلك"),
     "max_dialogs": ("450", "int", "🧹 حد القنوات بالحساب قبل المغادرة التلقائية"),
     "leave_on_delete": ("1", "toggle", "🚪 مغادرة المجموعة عند حذفها من البوت"),
+    "forced_on": ("1", "toggle", "📢 الانضمام التلقائي للقنوات الإجبارية"),
+    "forced_leave_min": ("5", "int", "📢 مغادرة القناة الإجبارية بعد (دقيقة، 0 = لا يغادر)"),
 }
 
 
@@ -269,6 +271,8 @@ class Runner:
         self.refreshed = {}
         self.started = time.time()
         self.last_kw = {}
+        self.forced_seen = {}
+        self.forced_lock = asyncio.Lock()
 
 
 RUNNERS = {}
@@ -484,6 +488,89 @@ async def broadcast_loop(r):
 
 
 # ============================ الردود على الكلمات ============================
+# ===================== القنوات الإجبارية (انضمام تلقائي) =====================
+_FORCED_LINK = re.compile(r"(?:https?://)?(?:t|telegram)\.me/[\w+/-]+|tg://(?:join\?invite=|resolve\?domain=)[\w-]+", re.I)
+_FORCED_USER = re.compile(r"(?<![\w/])@([A-Za-z]\w{3,31})")
+_leave_tasks = set()
+
+
+def forced_refs(ev):
+    """يستخرج روابط/يوزرات القنوات من نص الرسالة وروابطها المخفية وأزرارها (مثل رسالة الاشتراك الإجباري)"""
+    text = ev.raw_text or ""
+    refs = set(_FORCED_LINK.findall(text))
+    refs |= {"@" + u for u in _FORCED_USER.findall(text)}
+    for e in (ev.message.entities or []):
+        url = getattr(e, "url", None)
+        if url:
+            refs |= set(_FORCED_LINK.findall(url))
+    try:
+        for row in (ev.message.buttons or []):
+            for b in row:
+                url = getattr(b, "url", None)
+                if url:
+                    refs |= set(_FORCED_LINK.findall(url))
+    except Exception:
+        pass
+    return refs
+
+
+async def forced_leave_later(r, ent, minutes):
+    await asyncio.sleep(minutes * 60)
+    try:
+        managed = {c["chat_id"] for c in q("SELECT chat_id FROM chats WHERE account_id=?", r.id)}
+        if utils.get_peer_id(ent) in managed:
+            return  # مجموعة مضافة بالبوت ما تنغادر أبداً
+        await r.client.delete_dialog(ent)
+        log.info("forced: left %s", getattr(ent, "title", ent))
+    except Exception as e:
+        log.info("forced leave: %s", type(e).__name__)
+
+
+async def forced_join(r, ev):
+    try:
+        refs = forced_refs(ev)
+        if not refs:
+            return
+        own_user = (getattr(ev.chat, "username", None) or "").lower()
+        keep = max(0, S("forced_leave_min"))
+        for ref in refs:
+            kind, val = parse_ref(ref)
+            if kind not in ("invite", "user"):
+                continue
+            if kind == "user" and val.lower() == own_user:
+                continue
+            key = f"{kind}:{val.lower()}"
+            if time.time() - r.forced_seen.get(key, 0) < keep * 60 + 120:
+                continue
+            r.forced_seen[key] = time.time()
+            async with r.forced_lock:
+                await asyncio.sleep(random.uniform(2, 6))
+                try:
+                    if kind == "invite":
+                        ent = await join_invite(r, val)
+                    else:
+                        ent = await join_public(r, await r.client.get_entity(val))
+                except ValueError:
+                    continue  # يوزر شخص/بوت أو رابط منتهي
+                except Exception as e:
+                    nm = type(e).__name__
+                    if nm == "FloodWaitError":
+                        wait = int(getattr(e, "seconds", 60))
+                        r.forced_seen[key] = 0
+                        await notify(f"⏳ الحساب {r.phone}: FloodWait {wait}ث أثناء الانضمام للقناة الإجبارية.", f"fj{r.id}")
+                        await asyncio.sleep(min(wait, 300))
+                    elif nm not in ("UsernameNotOccupiedError", "UsernameInvalidError", "ChannelPrivateError"):
+                        await notify(f"⚠️ الحساب {r.phone}: تعذّر الانضمام للقناة الإجبارية {ref} ({nm})", f"fj{r.id}")
+                    continue
+            log.info("forced: %s joined %s", r.phone, getattr(ent, "title", val))
+            if keep and ent is not None:
+                t = asyncio.create_task(forced_leave_later(r, ent, keep))
+                _leave_tasks.add(t)
+                t.add_done_callback(_leave_tasks.discard)
+    except Exception:
+        log.exception("forced_join")
+
+
 async def on_incoming(r, ev):
     try:
         await handle_incoming(r, ev)
@@ -502,6 +589,8 @@ async def handle_incoming(r, ev):
     uid = ev.sender_id
     if uid in own_ids():
         return
+    if S("power") and S("forced_on"):
+        asyncio.create_task(forced_join(r, ev))
     sender = await ev.get_sender()
     if not isinstance(sender, types.User) or sender.bot or sender.deleted:
         return
