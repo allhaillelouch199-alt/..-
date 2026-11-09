@@ -72,6 +72,20 @@ CREATE TABLE IF NOT EXISTS replied(chat_id INTEGER, msg_id INTEGER, PRIMARY KEY(
 CREATE TABLE IF NOT EXISTS pm_contacts(account_id INTEGER, user_id INTEGER, access_hash INTEGER, name TEXT, PRIMARY KEY(account_id, user_id));
 """)
 db.commit()
+# أداء: WAL + بدون fsync لكل commit (كان يجمّد البوت لأن كل عملية كتابة = commit مستقل)
+for _p in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL", "PRAGMA temp_store=MEMORY"):
+    try:
+        db.execute(_p)
+    except Exception:
+        pass
+db.executescript("""
+CREATE INDEX IF NOT EXISTS ix_log_ts ON log(ts);
+CREATE INDEX IF NOT EXISTS ix_log_acc_ts ON log(account_id, ts);
+CREATE INDEX IF NOT EXISTS ix_users_acc_chat ON users(account_id, chat_id);
+CREATE INDEX IF NOT EXISTS ix_chats_acc ON chats(account_id, enabled);
+CREATE INDEX IF NOT EXISTS ix_replies_rule ON replies(rule_id);
+""")
+db.commit()
 
 
 def q(sql, *a):
@@ -122,14 +136,38 @@ SETTINGS = {
 }
 
 
+_SC = {}
+
+
+def _load_settings():
+    _SC.clear()
+    for r in q("SELECT key, value FROM settings"):
+        _SC[r["key"]] = r["value"]
+
+
+_load_settings()
+
+
 def S(key):
-    r = q1("SELECT value FROM settings WHERE key=?", key)
-    v = r["value"] if r else SETTINGS[key][0]
+    # كاش بالذاكرة: S() تنستدعى عشرات المرات لكل رسالة، وكانت كل مرة استعلام قاعدة
+    v = _SC.get(key, SETTINGS[key][0])
     return float(v) if SETTINGS[key][1] == "float" else int(float(v))
 
 
 def set_S(key, val):
     ex("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", key, str(val))
+    _SC[key] = str(val)
+
+
+_BG = set()
+
+
+def spawn(coro):
+    """يشغّل coroutine بالخلفية ويحتفظ بمرجع إلها"""
+    t = asyncio.ensure_future(coro)
+    _BG.add(t)
+    t.add_done_callback(_BG.discard)
+    return t
 
 
 # ================================== أدوات ==================================
@@ -211,15 +249,28 @@ def log_event(acc, chat, kind, ok, n=1, err=""):
        now(), acc, chat, kind, 1 if ok else 0, n, err)
 
 
-def remember(acc, chat, u):
+def member_row(acc, chat, u):
     if getattr(u, "bot", False) or getattr(u, "deleted", False):
-        return
+        return None
     h = getattr(u, "access_hash", None)
     if not h or getattr(u, "min", False):
-        return
+        return None
     name = " ".join(x for x in (u.first_name, u.last_name) if x) or "عضو"
-    ex("INSERT OR REPLACE INTO users(account_id,chat_id,user_id,access_hash,name,seen) VALUES(?,?,?,?,?,?)",
-       acc, chat, u.id, h, name, now())
+    return (acc, chat, u.id, h, name, now())
+
+
+def save_rows(rows):
+    """حفظ دفعة أعضاء بعملية commit وحدة (بدل commit لكل عضو)"""
+    if rows:
+        db.executemany("INSERT OR REPLACE INTO users(account_id,chat_id,user_id,access_hash,name,seen) "
+                       "VALUES(?,?,?,?,?,?)", rows)
+        db.commit()
+
+
+def remember(acc, chat, u):
+    row = member_row(acc, chat, u)
+    if row:
+        save_rows([row])
 
 
 def build_message(template, users):
@@ -269,6 +320,7 @@ class Runner:
         self.me_id = None
         self.lock = asyncio.Lock()
         self.last = 0.0
+        self.last_bc = 0.0  # آخر رسالة نشر (الفاصل الطويل يخص النشر فقط)
         self.paused_until = 0.0
         self.tasks = []
         self.refreshed = {}
@@ -323,7 +375,11 @@ async def start_runner(acc_id):
             await notify(f"⚠️ تعذّر تشغيل الحساب {acc['phone']}: {name}. راح أعيد المحاولة بعد دقيقة.", f"start{acc_id}")
             asyncio.get_event_loop().call_later(60, lambda: asyncio.create_task(start_runner(acc_id)))
         return False
-    r.client.add_event_handler(lambda ev: on_incoming(r, ev), events.NewMessage(incoming=True))
+    # كل رسالة واردة تنعالج بمهمة مستقلة حتى ما تنتظر الرسائل بعض (تيليثون يعالجها بالتسلسل)
+    async def _incoming(ev, r=r):
+        spawn(on_incoming(r, ev))  # يرجع فوراً، تيليثون ما ينتظر المعالجة
+
+    r.client.add_event_handler(_incoming, events.NewMessage(incoming=True))
     RUNNERS[acc_id] = r
     r.tasks = [asyncio.create_task(broadcast_loop(r)), asyncio.create_task(backlog_loop(r))]
     log.info("account %s started", acc["phone"])
@@ -379,9 +435,18 @@ async def on_send_error(r, ch, kind, e):
 async def safe_send(r, ch, text, kind, reply_to=None, entities=None, gap=None, n=1):
     if time.time() < r.paused_until:
         return False
+    is_kw = kind == "kw"
+    if not is_kw:
+        # فاصل النشر الطويل ننتظره "خارج" القفل، حتى ما تعلق الردود وراه (كانت تنتظر لين 45 ثانية)
+        lo, hi = sorted((S("delay_min"), S("delay_max")))
+        wait = r.last_bc + random.uniform(lo, hi) - time.time()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        if time.time() < r.paused_until:
+            return False
     async with r.lock:
-        lo, hi = sorted(gap or (S("delay_min"), S("delay_max")))
-        wait = r.last + random.uniform(lo, hi) - time.time()
+        # فاصل قصير جداً بين أي رسالتين من نفس الحساب (حماية من الفلود)
+        wait = r.last + random.uniform(0.5, 1.5) - time.time()
         if wait > 0:
             await asyncio.sleep(wait)
         try:
@@ -391,9 +456,13 @@ async def safe_send(r, ch, text, kind, reply_to=None, entities=None, gap=None, n
             raise
         except Exception as e:
             r.last = time.time()
+            if not is_kw:
+                r.last_bc = r.last
             await on_send_error(r, ch, kind, e)
             return False
         r.last = time.time()
+        if not is_kw:
+            r.last_bc = r.last
         log_event(r.id, ch["chat_id"], kind, True, n)
         ex("UPDATE chats SET fails=0 WHERE id=?", ch["id"])
         return True
@@ -406,23 +475,26 @@ async def scan_history(r, ch, limit):
         return
     peer = await r.client.get_input_entity(ch["chat_id"])
     pending = {}
+    rows = []
     async for m in r.client.iter_messages(ch["chat_id"], limit=limit):
         uid = m.sender_id
         if not uid or uid < 0 or uid in own_ids() or uid in pending:
             continue
         s = m.sender
         if isinstance(s, types.User) and not s.min:
-            remember(r.id, ch["chat_id"], s)
+            row = member_row(r.id, ch["chat_id"], s)
+            if row:
+                rows.append(row)
         elif not (isinstance(s, types.User) and s.bot):
             pending[uid] = m.id
+    save_rows(rows)
     items = list(pending.items())
     for i in range(0, len(items), 50):
         try:
             res = await r.client(functions.users.GetUsersRequest(
                 [types.InputUserFromMessage(peer, mid, uid) for uid, mid in items[i:i + 50]]))
-            for u in res:
-                if isinstance(u, types.User):
-                    remember(r.id, ch["chat_id"], u)
+            save_rows([x for x in (member_row(r.id, ch["chat_id"], u) for u in res
+                                   if isinstance(u, types.User)) if x])
         except Exception:
             pass
 
@@ -433,8 +505,16 @@ async def refresh_members(r, ch):
         return
     r.refreshed[key] = time.time()
     try:
+        buf = []
         async for u in r.client.iter_participants(ch["chat_id"], limit=10000):
-            remember(r.id, ch["chat_id"], u)
+            row = member_row(r.id, ch["chat_id"], u)
+            if row:
+                buf.append(row)
+            if len(buf) >= 500:  # commit واحد لكل 500 عضو (كان commit لكل عضو = تجميد البوت)
+                save_rows(buf)
+                buf = []
+                await asyncio.sleep(0)
+        save_rows(buf)
     except Exception as e:  # الحساب مو مشرف: نكمل بفحص الرسائل القديمة
         log.info("participants %s: %s", ch["title"], type(e).__name__)
     try:
@@ -471,11 +551,11 @@ async def process_chat(r, ch):
         text, ents = build_message(random.choice(msgs), chunk)
         ok = await safe_send(r, cur, text, "tag", entities=ents, n=len(chunk))
         t = now()
-        for u in chunk:
-            # عند الفشل نعيد المحاولة بعد 30 دقيقة بدل ما نعلق
-            ts = t if ok else t - cd + 1800
-            ex("INSERT OR REPLACE INTO cooldowns(chat_id,user_id,kind,ts) VALUES(?,?,?,?)",
-               ch["chat_id"], u["user_id"], "tag", ts)
+        # عند الفشل نعيد المحاولة بعد 30 دقيقة بدل ما نعلق
+        ts = t if ok else t - cd + 1800
+        db.executemany("INSERT OR REPLACE INTO cooldowns(chat_id,user_id,kind,ts) VALUES(?,?,?,?)",
+                       [(ch["chat_id"], u["user_id"], "tag", ts) for u in chunk])
+        db.commit()
 
 
 async def broadcast_loop(r):
@@ -553,10 +633,10 @@ async def forced_join(r, ev):
     try:
         if r.manual_busy or r.forced_pending >= 5:
             return
-        if not await forced_allowed(r, ev):
-            return
-        refs = forced_refs(ev)
+        refs = forced_refs(ev)  # فحص رخيص أول، قبل أي طلب شبكة
         if not refs:
+            return
+        if not await forced_allowed(r, ev):
             return
         own_user = (getattr(ev.chat, "username", None) or "").lower()
         keep = max(0, S("forced_leave_min"))
@@ -663,7 +743,7 @@ async def handle_incoming(r, ev):
 async def send_reply(r, ch, msg_id, sender, reps):
     await asyncio.sleep(random.uniform(*sorted((S("reply_delay_min"), S("reply_delay_max")))))
     text = random.choice(reps).replace("{name}", sender.first_name or "")
-    ok = await safe_send(r, ch, text, "kw", reply_to=msg_id, gap=(0.5, 2))
+    ok = await safe_send(r, ch, text, "kw", reply_to=msg_id)
     if ok:
         r.last_kw[ch["chat_id"]] = time.time()
     if not ok:
@@ -841,22 +921,34 @@ async def report_loop():
 STATE = {}
 
 
+async def _disconnect(c):
+    try:
+        await c.disconnect()
+    except Exception:
+        pass
+
+
 def clear_state(uid):
     st = STATE.pop(uid, None)
     if st and st.get("client"):
-        asyncio.create_task(st["client"].disconnect())
+        # إصلاح الخطأ: disconnect() بتيليثون يرجع Future مو coroutine فـ create_task تفشل
+        spawn(_disconnect(st["client"]))
 
 
 def admin_only(f):
-    async def w(ev):
-        if ev.sender_id not in ADMIN_IDS:
-            return
+    async def run(ev):
         try:
             await f(ev)
         except MessageNotModifiedError:
             pass
         except Exception:
             log.exception("ui error")
+
+    async def w(ev):
+        if ev.sender_id not in ADMIN_IDS:
+            return
+        # كل ضغطة/رسالة بمهمة مستقلة: العمليات الطويلة (إضافة مجموعة، فحص...) ما تجمّد باقي الأزرار
+        spawn(run(ev))
     return w
 
 
