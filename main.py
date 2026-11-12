@@ -80,6 +80,11 @@ CREATE TABLE IF NOT EXISTS ag_members(id INTEGER PRIMARY KEY AUTOINCREMENT, grou
 CREATE TABLE IF NOT EXISTS ag_msgs(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, text TEXT, enabled INTEGER DEFAULT 1);
 """)
 db.commit()
+try:
+    db.execute("ALTER TABLE accounts ADD COLUMN added_ts INTEGER DEFAULT 0")  # 0 = حساب قديم (يعتبر ناضج)
+    db.commit()
+except Exception:
+    pass
 # أداء: WAL + بدون fsync لكل commit (كان يجمّد البوت لأن كل عملية كتابة = commit مستقل)
 for _p in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL", "PRAGMA temp_store=MEMORY"):
     try:
@@ -148,6 +153,13 @@ SETTINGS = {
     "auto_gap_max": ("58", "int", "🔁 أكبر فاصل بين رسالتين بالجروب التلقائي (ثانية)"),
     "auto_gap_msgs": ("20", "int", "🔁 رسائل الغرباء المطلوبة بين رسالتنا والتالية"),
     "auto_stale_min": ("60", "int", "🔁 مدة التأخر قبل إهمال الجروب (دقيقة، 0 = لا يهمل)"),
+    "warmup_on": ("1", "toggle", "🌱 تسخين الحسابات الجديدة (حد يومي يتصاعد)"),
+    "warmup_start": ("30", "int", "🌱 حد اليوم الأول للحساب الجديد (رسالة)"),
+    "warmup_step": ("30", "int", "🌱 الزيادة اليومية للحساب الجديد (رسالة)"),
+    "pace_on": ("1", "toggle", "📈 توزيع الإرسال على اليوم كله (يمنع حرق الحد بالصباح)"),
+    "pace_burst": ("15", "int", "📈 رسائل مسموحة بالبداية قبل التوزيع"),
+    "strike_max": ("3", "int", "🛡 عدد حالات فلود/سبام قبل راحة الحساب لباقي اليوم (0 = معطل)"),
+    "typing_on": ("1", "toggle", "⌨️ حالة \"يكتب...\" قبل الإرسال بالجروبات"),
     "join_gap_min": ("40", "int", "🚪 أقل فاصل بين انضمامين لنفس الحساب (ثانية)"),
     "join_gap_max": ("90", "int", "🚪 أكبر فاصل بين انضمامين لنفس الحساب (ثانية)"),
 }
@@ -371,6 +383,9 @@ class Runner:
         self.manual_busy = 0
         self.day_key = 0
         self.sent_n = 0
+        self.added = (acc["added_ts"] if "added_ts" in acc.keys() else 0) or 0
+        self.strikes = 0
+        self.strike_day = 0
         self.gblock = {}
 
 
@@ -457,9 +472,11 @@ async def on_send_error(r, ch, kind, e):
         sec = int(getattr(e, "seconds", 60))
         r.paused_until = time.time() + sec + 5
         await notify(f"⏳ الحساب {r.phone} انحصر فلود {sec} ثانية (موقوف مؤقتاً).", f"fw{r.id}")
+        await strike(r, "فلود")
     elif name == "PeerFloodError":
         r.paused_until = time.time() + 3600
         await notify(f"🚫 الحساب {r.phone} جاله PeerFlood (سبام). انوقف ساعة.", f"pf{r.id}")
+        await strike(r, "PeerFlood")
     elif name in FATAL_ACC:
         await account_fatal(r, e)
     elif name in GROUP_ERR:
@@ -477,8 +494,7 @@ async def on_send_error(r, ch, kind, e):
 async def safe_send(r, ch, text, kind, reply_to=None, entities=None, gap=None, n=1):
     if time.time() < r.paused_until:
         return False
-    cap = S("daily_cap")
-    if cap > 0 and sent_today(r) >= cap:
+    if not cap_ok(r):
         return False
     is_kw = kind == "kw"
     if not is_kw:
@@ -786,8 +802,7 @@ async def handle_incoming(r, ev):
         return
     if isinstance(ch, dict):
         # حساب غير جاهز (موقوف/وصل الحد اليومي) يترك الرد لحساب ثاني منضم لنفس الجروب
-        cap = S("daily_cap")
-        if time.time() < r.paused_until or (cap > 0 and sent_today(r) >= cap):
+        if time.time() < r.paused_until or not cap_ok(r):
             return
     cd = int(S("kw_cd_h") * 3600)
     row = q1("SELECT ts FROM cooldowns WHERE chat_id=? AND user_id=? AND kind='kw'", ev.chat_id, uid)
@@ -964,6 +979,43 @@ def managed_ids(acc_id):
     s = {c["chat_id"] for c in q("SELECT chat_id FROM chats WHERE account_id=?", acc_id)}
     s |= {g["chat_id"] for g in q("SELECT chat_id FROM agroups WHERE chat_id IS NOT NULL")}
     return s
+
+
+def eff_cap(r):
+    """الحد اليومي الفعلي للحساب (مع التسخين للحسابات الجديدة)"""
+    cap = S("daily_cap")
+    if cap <= 0:
+        return 0
+    if S("warmup_on") and r.added:
+        days = int((now() - r.added) // 86400)
+        cap = min(cap, max(1, S("warmup_start") + days * S("warmup_step")))
+    return cap
+
+
+def cap_ok(r):
+    cap = eff_cap(r)
+    return cap <= 0 or sent_today(r) < cap
+
+
+def pace_ok(r):
+    """يوزع حد الحساب على اليوم بدل ما ينحرق بأول ساعات"""
+    cap = eff_cap(r)
+    if cap <= 0 or not S("pace_on"):
+        return True
+    frac = min(1.0, (now() - day_start()) / 86400)
+    return sent_today(r) < int(cap * frac) + S("pace_burst")
+
+
+async def strike(r, why):
+    """فلود/سبام: إذا تكرر بنفس اليوم الحساب ياخذ راحة لباقي اليوم حماية له"""
+    d = day_start()
+    if r.strike_day != d:
+        r.strike_day, r.strikes = d, 0
+    r.strikes += 1
+    lim = S("strike_max")
+    if lim > 0 and r.strikes >= lim:
+        r.paused_until = max(r.paused_until, d + 86400)
+        await notify(f"🛡 الحساب {r.phone} تكرر عليه {why} {r.strikes} مرات اليوم. انوقف لباقي اليوم حماية له.", f"rest{r.id}")
 
 
 def sent_today(r):
@@ -1160,9 +1212,11 @@ async def on_group_error(r, g, kind, e):
         sec = int(getattr(e, "seconds", 60))
         r.paused_until = time.time() + sec + 5
         await notify(f"⏳ الحساب {r.phone} انحصر فلود {sec} ثانية (موقوف مؤقتاً).", f"fw{r.id}")
+        await strike(r, "فلود")
     elif name == "PeerFloodError":
         r.paused_until = time.time() + 3600
         await notify(f"🚫 الحساب {r.phone} جاله PeerFlood (سبام). انوقف ساعة.", f"pf{r.id}")
+        await strike(r, "PeerFlood")
     elif name in FATAL_ACC:
         await account_fatal(r, e)
     elif name in GROUP_ERR:
@@ -1177,13 +1231,18 @@ async def on_group_error(r, g, kind, e):
 async def send_group(r, g, text, kind):
     if time.time() < r.paused_until:
         return False
-    cap = S("daily_cap")
-    if cap > 0 and sent_today(r) >= cap:
+    if not cap_ok(r):
         return False
     async with r.lock:
         wait = r.last + random.uniform(0.5, 1.5) - time.time()
         if wait > 0:
             await asyncio.sleep(wait)
+        if S("typing_on"):
+            try:
+                async with r.client.action(g["chat_id"], "typing"):
+                    await asyncio.sleep(min(3.0, 0.8 + len(text) / 60))
+            except Exception:
+                pass
         try:
             try:
                 await r.client.send_message(g["chat_id"], text, parse_mode=None)
@@ -1205,14 +1264,13 @@ async def send_group(r, g, text, kind):
 def ag_ready(g):
     """الحسابات المنضمة للجروب والجاهزة للإرسال هسه"""
     lo = min(S("delay_min"), S("delay_max"))
-    cap = S("daily_cap")
     t = time.time()
     out = []
     for aid in ag_joined_ids(g["id"]):
         r = RUNNERS.get(aid)
         if not r or t < r.paused_until or t < r.gblock.get(g["id"], 0):
             continue
-        if cap > 0 and sent_today(r) >= cap:
+        if not cap_ok(r) or not pace_ok(r):
             continue
         if t - r.last_bc < lo:
             continue
@@ -1370,7 +1428,7 @@ def stats_text():
             flag = " ⏸" if ag_st(g["id"])["stale"] else ""
             out.append(f"• {'🔁' if g['kind'] == 'auto' else '⭐'} {g['title'] or g['link']}: "
                        f"منضم {m['joined']}/{m['total']} | اليوم {n_today}{flag}")
-        cap = S("daily_cap")
+        cap = S("daily_cap")  # حد الحسابات الناضجة
         n_auto = sum(1 for g in ags if g["kind"] == "auto" and g["enabled"])
         if cap > 0 and n_auto:
             need = math.ceil(n_auto * 1440 / cap)
@@ -1476,6 +1534,7 @@ HELP = ("🤖 لوحة التحكم\n\nأوامر إضافية:\n"
         "/unblock ايدي - فك الحظر\n"
         "/blocked - قائمة المحظورين\n"
         "/check - فحص الحسابات\n"
+        "/capacity - سعة الإرسال المتبقية لكل حساب اليوم\n"
         "/status - الإحصائيات\n"
         "/backup - نسخة احتياطية من القاعدة\n"
         "/cancel - إلغاء الإدخال الحالي")
@@ -1909,7 +1968,7 @@ async def finish_login(ev, uid, c):
         ex("UPDATE accounts SET session=?, enabled=1, name=?, phone=? WHERE id=?", sess, name, phone, old["id"])
         aid = old["id"]
     else:
-        aid = ex("INSERT INTO accounts(phone,name,user_id,session) VALUES(?,?,?,?)", phone, name, me.id, sess).lastrowid
+        aid = ex("INSERT INTO accounts(phone,name,user_id,session,added_ts) VALUES(?,?,?,?,?)", phone, name, me.id, sess, now()).lastrowid
     ok = await start_runner(aid)
     await ev.respond(f"✅ تمت إضافة الحساب {name} ({phone})\n{'🟢 شغال' if ok else '⚠️ تعذر التشغيل'}",
                      buttons=[[B("📂 إضافة مجموعات", f"chats:{aid}")], [B("🏠 القائمة", "main")]])
@@ -1942,8 +2001,8 @@ async def import_strat_session(phone, session_str):
            session_str, name, phone, old["id"])
         aid = old["id"]
     else:
-        aid = ex("INSERT INTO accounts(phone,name,user_id,session) VALUES(?,?,?,?)",
-                  phone, name, me.id, session_str).lastrowid
+        aid = ex("INSERT INTO accounts(phone,name,user_id,session,added_ts) VALUES(?,?,?,?,?)",
+                  phone, name, me.id, session_str, now()).lastrowid
     ok = await start_runner(aid)
     await notify(f"🔗 استُلمت جلسة مستقلة من Strat للرقم {phone} ({name})\n"
                  f"{'🟢 شغال' if ok else '⚠️ تعذر التشغيل'}")
@@ -2170,6 +2229,24 @@ async def on_text(ev):
     if cmd == "/blocked":
         ids = [str(x["user_id"]) for x in q("SELECT user_id FROM blocked")]
         return await ev.respond("🚫 المحظورين:\n" + ("\n".join(ids) if ids else "لا أحد"))
+    if cmd == "/capacity":
+        lines, total_left = [], 0
+        for a in q("SELECT * FROM accounts WHERE enabled=1 ORDER BY id"):
+            r = RUNNERS.get(a["id"])
+            if not r:
+                lines.append(f"{a['phone']}: 🔴 غير شغال")
+                continue
+            cap, n = eff_cap(r), sent_today(r)
+            left = max(0, cap - n) if cap else 0
+            total_left += left
+            tags = []
+            if cap and S("warmup_on") and r.added and cap < S("daily_cap"):
+                tags.append("🌱 تسخين")
+            if time.time() < r.paused_until:
+                tags.append(f"⏳ موقوف {int(r.paused_until - time.time()) // 60} د")
+            lines.append(f"{a['phone']}: {n}/{cap or '∞'} {' '.join(tags)}")
+        head = f"📈 السعة اليوم\nالمتبقي الكلي: {total_left} رسالة"
+        return await ev.respond((head + "\n\n" + "\n".join(lines))[:4000])
     if cmd == "/check":
         lines = []
         for a in q("SELECT * FROM accounts"):
