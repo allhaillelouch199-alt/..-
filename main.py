@@ -163,6 +163,26 @@ def set_S(key, val):
     _SC[key] = str(val)
 
 
+def T(key, default=""):
+    """قيمة نصية من جدول الإعدادات (رابط/مفتاح)، بلا تحويل لرقم مثل S()."""
+    return _SC.get(key, default)
+
+
+def set_T(key, val):
+    set_S(key, val)
+
+
+def strat_cfg():
+    """إعدادات ربط Strat: من زر الإعدادات إن وُجدت، وإلا من متغيرات البيئة."""
+    url = (T("strat_api_url", "") or STRAT_API_URL).rstrip("/")
+    key = T("strat_api_key", "") or STRAT_API_KEY
+    try:
+        poll = int(T("strat_poll_seconds", "") or STRAT_POLL_SECONDS)
+    except ValueError:
+        poll = STRAT_POLL_SECONDS
+    return url, key, poll
+
+
 _BG = set()
 
 
@@ -972,7 +992,8 @@ def main_menu():
     p = "🟢" if S("power") else "🔴"
     return [[B("👤 الحسابات", "accs"), B("📨 رسائل النشر", "msgs")],
             [B("🔑 الكلمات والردود", "rules"), B("📊 الإحصائيات", "stats")],
-            [B("⚙️ الإعدادات", "sets"), B(f"{p} تشغيل/إيقاف الكل", "power")]]
+            [B("⚙️ الإعدادات", "sets"), B(f"{p} تشغيل/إيقاف الكل", "power")],
+            [B("🔗 ربط Strat", "strat")]]
 
 
 HELP = ("🤖 لوحة التحكم\n\nأوامر إضافية:\n"
@@ -1087,6 +1108,31 @@ async def v_sets(ev):
     await ui(ev, "⚙️ الإعدادات\nاضغط على الإعداد لتغييره.", btns)
 
 
+def _mask_key(k):
+    if not k:
+        return "—"
+    return k[:3] + "•" * max(len(k) - 6, 3) + k[-3:] if len(k) > 6 else "•" * len(k)
+
+
+async def v_strat(ev):
+    url, key, poll = strat_cfg()
+    txt = (
+        "🔗 ربط Strat\n\n"
+        f"الرابط: {url or '— غير مضبوط —'}\n"
+        f"المفتاح: {_mask_key(key)}\n"
+        f"كل كم ثانية: {poll}\n\n"
+        "هذا البوت يسحب من Strat جلسات مستقلة جاهزة ويضيفها كحسابات تلقائياً."
+    )
+    btns = [
+        [B("✏️ تعديل الرابط", "stratset:url")],
+        [B("✏️ تعديل المفتاح", "stratset:key")],
+        [B("✏️ تعديل زمن السحب", "stratset:poll")],
+        [B("🔄 اسحب الآن", "stratnow")],
+        [B("🔙 رجوع", "main")],
+    ]
+    await ui(ev, txt, btns)
+
+
 async def on_cb(ev):
     try:
         await ev.answer()
@@ -1105,6 +1151,19 @@ async def on_cb(ev):
         await v_main(ev)
     elif c == "stats":
         await ui(ev, stats_text(), [[B("🔄 تحديث", "stats"), B("🔙 رجوع", "main")]])
+    # ---- ربط Strat
+    elif c == "strat":
+        await v_strat(ev)
+    elif c == "stratset" and a in {"url", "key", "poll"}:
+        STATE[uid] = {"step": "stratset", "field": a}
+        label = {"url": "رابط Strat (مثال: https://your-app.up.railway.app)",
+                  "key": "المفتاح السري (يجب أن يطابق EXTERNAL_BOT_API_KEY عند Strat حرفياً)",
+                  "poll": "كل كم ثانية يسحب (رقم بالثواني)"}[a]
+        await ui(ev, f"✏️ أرسل القيمة الجديدة لـ {label}")
+    elif c == "stratnow":
+        await ui(ev, "⏳ جاري السحب من Strat...")
+        await strat_poll_once()
+        await v_strat(ev)
     # ---- حسابات
     elif c == "accs":
         await v_accs(ev)
@@ -1286,9 +1345,10 @@ async def strat_poll_once():
     import urllib.request as _ur
     import urllib.error as _ue
 
+    url, key, _poll = strat_cfg()
     req = _ur.Request(
-        f"{STRAT_API_URL}/partner/external-sessions",
-        headers={"X-Partner-Key": STRAT_API_KEY},
+        f"{url}/partner/external-sessions",
+        headers={"X-Partner-Key": key},
     )
     try:
         loop = asyncio.get_event_loop()
@@ -1321,15 +1381,16 @@ async def strat_poll_once():
 
 
 async def strat_poll_loop():
-    if not (STRAT_API_URL and STRAT_API_KEY):
-        log.info("STRAT_API_URL/STRAT_API_KEY غير مضبوطين — تعطيل استيراد جلسات Strat")
-        return
     while True:
+        url, key, poll = strat_cfg()
+        if not (url and key):
+            await asyncio.sleep(30)
+            continue
         try:
             await strat_poll_once()
         except Exception as e:
             log.warning("strat_poll_loop: %s", e)
-        await asyncio.sleep(STRAT_POLL_SECONDS)
+        await asyncio.sleep(poll)
 
 
 def parse_ref(ref):
@@ -1649,6 +1710,21 @@ async def on_text(ev):
         set_S(k, v if SETTINGS[k][1] == "float" else int(v))
         STATE.pop(uid, None)
         return await v_sets(ev)
+
+    if step == "stratset":
+        field = st["field"]
+        if field == "poll":
+            try:
+                int(num(txt))
+            except ValueError:
+                return await ev.respond("❌ ارسل رقم صحيح بالثواني.")
+            set_T("strat_poll_seconds", int(num(txt)))
+        elif field == "url":
+            set_T("strat_api_url", txt.strip().rstrip("/"))
+        elif field == "key":
+            set_T("strat_api_key", txt.strip())
+        STATE.pop(uid, None)
+        return await v_strat(ev)
 
 
 # ================================== التشغيل ==================================
