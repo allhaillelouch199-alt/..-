@@ -78,10 +78,21 @@ CREATE TABLE IF NOT EXISTS pm_contacts(account_id INTEGER, user_id INTEGER, acce
 CREATE TABLE IF NOT EXISTS agroups(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, link TEXT, hash TEXT, uname TEXT, access TEXT, title TEXT, chat_id INTEGER, enabled INTEGER DEFAULT 1, gap_s INTEGER DEFAULT 30);
 CREATE TABLE IF NOT EXISTS ag_members(id INTEGER PRIMARY KEY AUTOINCREMENT, group_id INTEGER, account_id INTEGER, status TEXT DEFAULT 'pending', tries INTEGER DEFAULT 0, err TEXT, checked INTEGER DEFAULT 0, UNIQUE(group_id, account_id));
 CREATE TABLE IF NOT EXISTS ag_msgs(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, text TEXT, enabled INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS kw_hist(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, account_id INTEGER, chat_id INTEGER, ts INTEGER);
 """)
 db.commit()
 try:
     db.execute("ALTER TABLE accounts ADD COLUMN added_ts INTEGER DEFAULT 0")  # 0 = حساب قديم (يعتبر ناضج)
+    db.commit()
+except Exception:
+    pass
+try:
+    db.execute("ALTER TABLE accounts ADD COLUMN source TEXT DEFAULT 'manual'")
+    db.commit()
+except Exception:
+    pass
+try:
+    db.execute("ALTER TABLE agroups ADD COLUMN folder TEXT")  # رابط مجلد تيليجرام (addlist) اللي جاء منه الجروب
     db.commit()
 except Exception:
     pass
@@ -97,6 +108,7 @@ CREATE INDEX IF NOT EXISTS ix_log_acc_ts ON log(account_id, ts);
 CREATE INDEX IF NOT EXISTS ix_users_acc_chat ON users(account_id, chat_id);
 CREATE INDEX IF NOT EXISTS ix_chats_acc ON chats(account_id, enabled);
 CREATE INDEX IF NOT EXISTS ix_replies_rule ON replies(rule_id);
+CREATE INDEX IF NOT EXISTS ix_kwh ON kw_hist(user_id, ts);
 """)
 db.commit()
 
@@ -118,14 +130,8 @@ def ex(sql, *a):
 # ================================ الإعدادات ================================
 SETTINGS = {
     "power": ("1", "toggle", "⚡ النظام الكلي"),
-    "broadcast_on": ("1", "toggle", "📨 النشر التلقائي"),
     "keyword_on": ("1", "toggle", "🔑 الردود بالكلمات"),
     "notify_on": ("1", "toggle", "🔔 إشعارات الأخطاء"),
-    "tag_cd_h": ("6", "float", "⏱ انتظار التاك لنفس الشخص (ساعة)"),
-    "kw_cd_h": ("3", "float", "⏱ انتظار الرد لنفس الشخص (ساعة)"),
-    "tag_batch": ("3", "int", "👥 عدد الأشخاص بالرسالة الواحدة"),
-    "round_max": ("20", "int", "🎯 أقصى أشخاص لكل مجموعة بالجولة"),
-    "round_sleep": ("10", "int", "🔁 الانتظار بين الجولات (دقيقة)"),
     "delay_min": ("20", "int", "⏳ أقل فاصل بين رسائل النشر (ثانية)"),
     "delay_max": ("45", "int", "⏳ أكبر فاصل بين رسائل النشر (ثانية)"),
     "reply_delay_min": ("3", "int", "💬 أقل تأخير قبل الرد (ثانية)"),
@@ -146,12 +152,17 @@ SETTINGS = {
     "forced_max_h": ("12", "int", "📢 أقصى انضمام للقنوات الإجبارية بالساعة لكل حساب"),
     "forced_gap_s": ("40", "int", "📢 أقل فاصل بين انضمامين (ثانية)"),
     "forced_admins": ("0", "toggle", "📢 الانضمام للقنوات اللي يرسلها المشرفون (البوتات دائماً، الأعضاء مرفوضين)"),
+    "kw_max_per_window": ("2", "int", "💬 أقصى ردود على نفس العضو خلال المدة (بكل الجروبات مجتمعة)"),
+    "kw_window_min": ("60", "int", "💬 مدة العدّ للردود (دقيقة)"),
+    "kw_acc_once": ("1", "toggle", "💬 الحساب الواحد يرد مرة وحدة بس على العضو خلال المدة"),
+    "reply_reserve": ("30", "int", "💬 رسائل محجوزة للردود من الحد اليومي (النشر يوقف قبلها)"),
     "auto_on": ("1", "toggle", "🔁 الجروبات التلقائية"),
     "special_on": ("1", "toggle", "⭐ الجروبات المخصصة"),
     "daily_cap": ("300", "int", "🚦 أقصى رسائل لكل حساب باليوم (0 = بلا حد)"),
     "auto_gap_min": ("40", "int", "🔁 أقل فاصل بين رسالتين بالجروب التلقائي (ثانية)"),
     "auto_gap_max": ("58", "int", "🔁 أكبر فاصل بين رسالتين بالجروب التلقائي (ثانية)"),
     "auto_gap_msgs": ("20", "int", "🔁 رسائل الغرباء المطلوبة بين رسالتنا والتالية"),
+    "special_gap_msgs": ("10", "int", "⭐ رسائل الغرباء المطلوبة بين حساب وحساب بالجروب المخصص (0 = بلا شرط)"),
     "auto_stale_min": ("60", "int", "🔁 مدة التأخر قبل إهمال الجروب (دقيقة، 0 = لا يهمل)"),
     "warmup_on": ("1", "toggle", "🌱 تسخين الحسابات الجديدة (حد يومي يتصاعد)"),
     "warmup_start": ("30", "int", "🌱 حد اليوم الأول للحساب الجديد (رسالة)"),
@@ -385,6 +396,7 @@ class Runner:
         self.sent_n = 0
         self.added = (acc["added_ts"] if "added_ts" in acc.keys() else 0) or 0
         self.strikes = 0
+        self.reply_busy = 0
         self.strike_day = 0
         self.gblock = {}
 
@@ -437,8 +449,7 @@ async def start_runner(acc_id):
     r.client.add_event_handler(_incoming, events.NewMessage(incoming=True))
     RUNNERS[acc_id] = r
     ag_sync_account(acc_id)
-    r.tasks = [asyncio.create_task(broadcast_loop(r)), asyncio.create_task(backlog_loop(r)),
-               asyncio.create_task(ag_join_loop(r))]
+    r.tasks = [asyncio.create_task(backlog_loop(r)), asyncio.create_task(ag_join_loop(r))]
     log.info("account %s started", acc["phone"])
     return True
 
@@ -531,111 +542,6 @@ async def safe_send(r, ch, text, kind, reply_to=None, entities=None, gap=None, n
 
 
 # ================================== النشر ==================================
-async def scan_history(r, ch, limit):
-    """يجمع الأعضاء من كاتبي الرسائل الأخيرة (ينفع حتى لو الحساب مو مشرف)"""
-    if limit <= 0:
-        return
-    peer = await r.client.get_input_entity(ch["chat_id"])
-    pending = {}
-    rows = []
-    async for m in r.client.iter_messages(ch["chat_id"], limit=limit):
-        uid = m.sender_id
-        if not uid or uid < 0 or uid in own_ids() or uid in pending:
-            continue
-        s = m.sender
-        if isinstance(s, types.User) and not s.min:
-            row = member_row(r.id, ch["chat_id"], s)
-            if row:
-                rows.append(row)
-        elif not (isinstance(s, types.User) and s.bot):
-            pending[uid] = m.id
-    save_rows(rows)
-    items = list(pending.items())
-    for i in range(0, len(items), 50):
-        try:
-            res = await r.client(functions.users.GetUsersRequest(
-                [types.InputUserFromMessage(peer, mid, uid) for uid, mid in items[i:i + 50]]))
-            save_rows([x for x in (member_row(r.id, ch["chat_id"], u) for u in res
-                                   if isinstance(u, types.User)) if x])
-        except Exception:
-            pass
-
-
-async def refresh_members(r, ch):
-    key = ch["chat_id"]
-    if time.time() - r.refreshed.get(key, 0) < 1800:
-        return
-    r.refreshed[key] = time.time()
-    try:
-        buf = []
-        async for u in r.client.iter_participants(ch["chat_id"], limit=10000):
-            row = member_row(r.id, ch["chat_id"], u)
-            if row:
-                buf.append(row)
-            if len(buf) >= 500:  # commit واحد لكل 500 عضو (كان commit لكل عضو = تجميد البوت)
-                save_rows(buf)
-                buf = []
-                await asyncio.sleep(0)
-        save_rows(buf)
-    except Exception as e:  # الحساب مو مشرف: نكمل بفحص الرسائل القديمة
-        log.info("participants %s: %s", ch["title"], type(e).__name__)
-    try:
-        await scan_history(r, ch, S("history_scan"))
-    except Exception as e:
-        log.info("history %s: %s", ch["title"], type(e).__name__)
-
-
-def active_now():
-    return S("power") and S("broadcast_on") and not in_quiet()
-
-
-async def process_chat(r, ch):
-    msgs = [m["text"] for m in q("SELECT text FROM messages WHERE enabled=1")]
-    if not msgs:
-        return
-    await refresh_members(r, ch)
-    cd = int(S("tag_cd_h") * 3600)
-    rows = q("""SELECT u.user_id, u.access_hash, u.name FROM users u
-                WHERE u.account_id=? AND u.chat_id=?
-                AND u.user_id NOT IN (SELECT user_id FROM blocked)
-                AND NOT EXISTS (SELECT 1 FROM cooldowns c WHERE c.chat_id=u.chat_id
-                                AND c.user_id=u.user_id AND c.kind='tag' AND c.ts>?)
-                ORDER BY RANDOM() LIMIT ?""", r.id, ch["chat_id"], now() - cd, max(1, S("round_max")))
-    rows = [u for u in rows if u["user_id"] not in own_ids()]
-    batch = max(1, S("tag_batch"))
-    for i in range(0, len(rows), batch):
-        if not active_now() or time.time() < r.paused_until:
-            return
-        cur = q1("SELECT * FROM chats WHERE id=?", ch["id"])
-        if not cur or not cur["enabled"]:
-            return
-        chunk = rows[i:i + batch]
-        text, ents = build_message(random.choice(msgs), chunk)
-        ok = await safe_send(r, cur, text, "tag", entities=ents, n=len(chunk))
-        t = now()
-        # عند الفشل نعيد المحاولة بعد 30 دقيقة بدل ما نعلق
-        ts = t if ok else t - cd + 1800
-        db.executemany("INSERT OR REPLACE INTO cooldowns(chat_id,user_id,kind,ts) VALUES(?,?,?,?)",
-                       [(ch["chat_id"], u["user_id"], "tag", ts) for u in chunk])
-        db.commit()
-
-
-async def broadcast_loop(r):
-    await asyncio.sleep(random.uniform(5, 20))
-    while True:
-        try:
-            if active_now() and time.time() >= r.paused_until:
-                for ch in q("SELECT * FROM chats WHERE account_id=? AND enabled=1", r.id):
-                    if not active_now():
-                        break
-                    await process_chat(r, ch)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("broadcast loop")
-        await asyncio.sleep(max(60, S("round_sleep") * 60))
-
-
 # ============================ الردود على الكلمات ============================
 # ===================== القنوات الإجبارية (انضمام تلقائي) =====================
 _FORCED_LINK = re.compile(r"(?:https?://)?(?:t|telegram)\.me/[\w+/-]+|tg://(?:join\?invite=|resolve\?domain=)[\w-]+", re.I)
@@ -770,12 +676,9 @@ async def handle_incoming(r, ev):
         ag_track(ag, ev)  # عدّاد رسائل الغرباء للجروبات التلقائية
     if not ev.sender_id:
         return
-    ch = q1("SELECT * FROM chats WHERE account_id=? AND chat_id=? AND enabled=1", r.id, ev.chat_id)
-    if not ch and ag:
-        # جروب تلقائي/مخصص: نفس نظام الكلمات والردود، وحساب واحد بس يرد
-        ch = {"id": None, "chat_id": ev.chat_id, "title": ag["title"], "fails": 0, "_ag": True}
-    if not ch:
+    if not ag:
         return
+    ch = {"id": None, "chat_id": ev.chat_id, "title": ag["title"], "fails": 0}
     uid = ev.sender_id
     if uid in own_ids():
         return
@@ -791,7 +694,6 @@ async def handle_incoming(r, ev):
             sender = res[0]
         except Exception:
             pass
-    remember(r.id, ev.chat_id, sender)
     if not (S("power") and S("keyword_on")):
         return
     text = ev.raw_text
@@ -800,28 +702,59 @@ async def handle_incoming(r, ev):
     hit = match_rule(text)
     if not hit:
         return
-    if isinstance(ch, dict):
-        # حساب غير جاهز (موقوف/وصل الحد اليومي) يترك الرد لحساب ثاني منضم لنفس الجروب
-        if time.time() < r.paused_until or not cap_ok(r):
-            return
-    cd = int(S("kw_cd_h") * 3600)
-    row = q1("SELECT ts FROM cooldowns WHERE chat_id=? AND user_id=? AND kind='kw'", ev.chat_id, uid)
-    if row and now() - row["ts"] < cd:
+    # حساب غير جاهز (موقوف/وصل الحد اليومي) يترك الرد لحساب ثاني منضم لنفس الجروب
+    if time.time() < r.paused_until or not cap_ok(r):
         return
-    ex("INSERT OR REPLACE INTO cooldowns(chat_id,user_id,kind,ts) VALUES(?,?,?,?)", ev.chat_id, uid, "kw", now())
+    # لا ننتقل لـawait بين الفحص والحجز: حتى حساب واحد بس ياخذ الرسالة
+    if not kw_can(r, uid) or not claim_msg(ev.chat_id, ev.id):
+        return
+    kw_mark(r, ev.chat_id, uid)
     ex("UPDATE rules SET hits=hits+1 WHERE id=?", hit[0])
-    ex("INSERT OR IGNORE INTO replied(chat_id,msg_id) VALUES(?,?)", ev.chat_id, ev.id)
     asyncio.create_task(send_reply(r, ch, ev.id, sender, hit[1]))
 
 
+LAST_KW = {}        # chat_id -> وقت آخر رد (للخمول)
+BACKLOG_BUSY = set()
+
+
+def kw_can(r, uid):
+    """قواعد الرد على العضو: أقصى X ردود خلال المدة (بكل الجروبات)، والحساب الواحد مرة وحدة"""
+    t0 = now() - max(1, S("kw_window_min")) * 60
+    rows = q("SELECT account_id FROM kw_hist WHERE user_id=? AND ts>?", uid, t0)
+    if len(rows) >= max(1, S("kw_max_per_window")):
+        return False
+    if S("kw_acc_once") and any(x["account_id"] == r.id for x in rows):
+        return False
+    return True
+
+
+def kw_mark(r, chat_id, uid):
+    ex("INSERT INTO kw_hist(user_id,account_id,chat_id,ts) VALUES(?,?,?,?)", uid, r.id, chat_id, now())
+
+
+def kw_unmark(r, uid):
+    ex("DELETE FROM kw_hist WHERE id=(SELECT id FROM kw_hist WHERE user_id=? AND account_id=? "
+       "ORDER BY ts DESC, id DESC LIMIT 1)", uid, r.id)
+
+
+def claim_msg(chat_id, msg_id):
+    """حساب واحد بس يرد على الرسالة (الاول ياخذها)"""
+    return ex("INSERT OR IGNORE INTO replied(chat_id,msg_id) VALUES(?,?)", chat_id, msg_id).rowcount > 0
+
+
 async def send_reply(r, ch, msg_id, sender, reps):
-    await asyncio.sleep(random.uniform(*sorted((S("reply_delay_min"), S("reply_delay_max")))))
-    text = random.choice(reps).replace("{name}", sender.first_name or "")
-    ok = await safe_send(r, ch, text, "kw", reply_to=msg_id)
+    r.reply_busy += 1  # الردود لها أولوية: الحساب ما ينشر تلقائي وهو مشغول برد
+    try:
+        await asyncio.sleep(random.uniform(*sorted((S("reply_delay_min"), S("reply_delay_max")))))
+        text = random.choice(reps).replace("{name}", sender.first_name or "")
+        ok = await safe_send(r, ch, text, "kw", reply_to=msg_id)
+    finally:
+        r.reply_busy -= 1
     if ok:
-        r.last_kw[ch["chat_id"]] = time.time()
-    if not ok:
-        ex("DELETE FROM cooldowns WHERE chat_id=? AND user_id=? AND kind='kw'", ch["chat_id"], sender.id)
+        LAST_KW[ch["chat_id"]] = time.time()
+    else:
+        kw_unmark(r, sender.id)
+        ex("DELETE FROM replied WHERE chat_id=? AND msg_id=?", ch["chat_id"], msg_id)
 
 
 def match_rule(text):
@@ -835,7 +768,6 @@ def match_rule(text):
 
 async def backlog_reply(r, ch):
     """إذا مرت فترة خمول، يرد على رسالة قديمة فيها كلمة محفزة من شخص مو بوت وما انرد عليه"""
-    cd = int(S("kw_cd_h") * 3600)
     max_age = S("backlog_age_h") * 3600
     me = own_ids()
     async for m in r.client.iter_messages(ch["chat_id"], limit=max(10, S("history_scan"))):
@@ -851,16 +783,15 @@ async def backlog_reply(r, ch):
             continue
         if q1("SELECT 1 FROM blocked WHERE user_id=?", uid):
             continue
-        row = q1("SELECT ts FROM cooldowns WHERE chat_id=? AND user_id=? AND kind='kw'", ch["chat_id"], uid)
-        if row and now() - row["ts"] < cd:
+        if not kw_can(r, uid):
             continue
         hit = match_rule(m.raw_text)
         if not hit:
             continue
-        ex("INSERT OR REPLACE INTO cooldowns(chat_id,user_id,kind,ts) VALUES(?,?,?,?)", ch["chat_id"], uid, "kw", now())
-        ex("INSERT OR IGNORE INTO replied(chat_id,msg_id) VALUES(?,?)", ch["chat_id"], m.id)
+        if not claim_msg(ch["chat_id"], m.id):
+            continue
+        kw_mark(r, ch["chat_id"], uid)
         ex("UPDATE rules SET hits=hits+1 WHERE id=?", hit[0])
-        remember(r.id, ch["chat_id"], s)
         await send_reply(r, ch, m.id, s, hit[1])
         return True
     return False
@@ -870,12 +801,20 @@ async def backlog_loop(r):
     await asyncio.sleep(30)
     while True:
         try:
-            if S("power") and S("keyword_on") and S("backlog_on") and time.time() >= r.paused_until:
+            if S("power") and S("keyword_on") and S("backlog_on") and time.time() >= r.paused_until and cap_ok(r):
                 idle = max(1, S("idle_min")) * 60
-                for ch in q("SELECT * FROM chats WHERE account_id=? AND enabled=1", r.id):
-                    if time.time() - r.last_kw.get(ch["chat_id"], r.started) >= idle:
-                        r.last_kw[ch["chat_id"]] = time.time()  # فترة خمول جديدة
-                        await backlog_reply(r, ch)
+                by_chat, joined = ag_cache()
+                for g in list(by_chat.values()):
+                    cid = g["chat_id"]
+                    if r.id not in joined.get(g["id"], ()) or cid in BACKLOG_BUSY:
+                        continue
+                    if time.time() - LAST_KW.get(cid, r.started) >= idle:
+                        LAST_KW[cid] = time.time()  # فترة خمول جديدة
+                        BACKLOG_BUSY.add(cid)
+                        try:
+                            await backlog_reply(r, {"id": None, "chat_id": cid, "title": g["title"], "fails": 0})
+                        finally:
+                            BACKLOG_BUSY.discard(cid)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -992,9 +931,13 @@ def eff_cap(r):
     return cap
 
 
-def cap_ok(r):
+def cap_ok(r, auto=False):
+    """auto=True: النشر التلقائي يوقف قبل الحد بـ(reply_reserve) حتى يبقى للردود"""
     cap = eff_cap(r)
-    return cap <= 0 or sent_today(r) < cap
+    if cap <= 0:
+        return True
+    reserve = min(S("reply_reserve"), cap // 4) if auto else 0
+    return sent_today(r) < cap - reserve
 
 
 def pace_ok(r):
@@ -1067,10 +1010,81 @@ def ag_mark_joined(r, gid, mid, ent, was_requested=False):
     return title
 
 
+async def ag_join_folder(r, row):
+    """ينضم الحساب لكل جروبات المجلد بطلب وحد (يشمل الخاصة)"""
+    slug = row["folder"]
+    chk = functions.chatlists.CheckChatlistInviteRequest
+    info = await r.client(chk(slug=slug))
+    already = type(info).__name__ == "ChatlistInviteAlready"
+    missing = list(info.missing_peers if already else info.peers)
+    if missing:
+        by_id = {utils.get_peer_id(c): c for c in info.chats}
+        inputs = [utils.get_input_peer(by_id[utils.get_peer_id(p)]) for p in missing if utils.get_peer_id(p) in by_id]
+        for attempt in (1, 2):
+            try:
+                await r.client(functions.chatlists.JoinChatlistInviteRequest(slug=slug, peers=inputs))
+                break
+            except Exception as e:
+                if "TooMuch" in type(e).__name__ and attempt == 1:
+                    await free_room(r, len(inputs) + 10)
+                    continue
+                raise
+    info = await r.client(chk(slug=slug))
+    in_ids = ({utils.get_peer_id(p) for p in info.already_peers}
+              if type(info).__name__ == "ChatlistInviteAlready" else set())
+    for m in q("""SELECT m.id AS mid, m.tries AS tries, g.chat_id AS cid FROM ag_members m
+                  JOIN agroups g ON g.id=m.group_id
+                  WHERE m.account_id=? AND g.folder=? AND m.status='pending'""", r.id, slug):
+        if m["cid"] in in_ids:
+            ex("UPDATE ag_members SET status='joined', err=NULL WHERE id=?", m["mid"])
+        else:
+            tries = (m["tries"] or 0) + 1
+            ex("UPDATE ag_members SET tries=?, status=?, err=? WHERE id=?", tries,
+               "failed" if tries >= 3 else "pending", "ما انضم من المجلد (يمكن يحتاج موافقة الإدارة)", m["mid"])
+    ag_inval()
+
+
+async def ag_add_folder(kind, slug):
+    """يضيف كل جروبات مجلد تيليجرام. يرجع سطور النتيجة"""
+    rs = list(RUNNERS.values())
+    if not rs:
+        return ["❌ ماكو حساب شغال حتى يقرأ المجلد."]
+    try:
+        info = await rs[0].client(functions.chatlists.CheckChatlistInviteRequest(slug=slug))
+    except Exception as e:
+        return [f"❌ المجلد: {err_text(e)}"]
+    added = dup = skipped = 0
+    for c in info.chats:
+        if not isinstance(c, (types.Chat, types.Channel)):
+            continue
+        if isinstance(c, types.Channel) and c.broadcast and not c.megagroup:
+            skipped += 1  # قناة بث: الحساب ما يكدر ينشر بيها
+            continue
+        cid = utils.get_peer_id(c)
+        if q1("SELECT id FROM agroups WHERE chat_id=?", cid):
+            dup += 1
+            continue
+        gid = ex("INSERT INTO agroups(kind,link,access,title,chat_id,folder,gap_s) VALUES(?,?,?,?,?,?,60)",
+                 kind, f"https://t.me/addlist/{slug}", "folder", utils.get_display_name(c), cid, slug).lastrowid
+        ag_sync_group(gid)
+        ag_start(gid)
+        added += 1
+    out = f"✅ المجلد: انضافت {added} جروب"
+    if dup:
+        out += f" | {dup} مضافة من قبل"
+    if skipped:
+        out += f" | {skipped} قناة بث انتجاهلت (ما يكدر ينشر بيها)"
+    return [out]
+
+
 async def ag_join_one(r, row):
     mid, gid = row["mid"], row["id"]
     label = row["title"] or row["link"]
     try:
+        if row["folder"]:
+            await asyncio.wait_for(ensure_room(r), 120)
+            await ag_join_folder(r, row)
+            return
         await asyncio.wait_for(ensure_room(r), 120)
         if row["hash"]:
             ent = await join_invite(r, row["hash"])
@@ -1197,7 +1211,7 @@ async def ag_init(g, r):
             st["gap"] += 1
     except Exception as e:
         log.info("ag init %s: %s", g["title"], type(e).__name__)
-    if st["last_sent"] and time.time() - st["last_sent"] < S("auto_gap_min"):
+    if g["kind"] == "auto" and st["last_sent"] and time.time() - st["last_sent"] < S("auto_gap_min"):
         st["next_ts"] = st["last_sent"] + S("auto_gap_min")
 
 
@@ -1270,7 +1284,7 @@ def ag_ready(g):
         r = RUNNERS.get(aid)
         if not r or t < r.paused_until or t < r.gblock.get(g["id"], 0):
             continue
-        if not cap_ok(r) or not pace_ok(r):
+        if r.reply_busy or not cap_ok(r, True) or not pace_ok(r):
             continue
         if t - r.last_bc < lo:
             continue
@@ -1339,8 +1353,18 @@ async def ag_tick_special(g):
     """جروب مخصص: الحسابات تدور بالتناوب، كل حساب بكليشته الثابتة، والفاصل من إعداد الجروب"""
     st = ag_st(g["id"])
     t = time.time()
+    if not st["inited"]:
+        rs0 = [RUNNERS[a] for a in ag_joined_ids(g["id"]) if a in RUNNERS]
+        if not rs0:
+            return 15
+        st["inited"] = True
+        await ag_init(g, random.choice(rs0))  # يعدّ رسائل الغرباء من آخر رسالة لحساباتنا
+        t = time.time()
     if t < st["next_ts"]:
         return max(0.5, min(3, st["next_ts"] - t))
+    need = max(0, S("special_gap_msgs"))
+    if st["gap"] < need:  # لازم توصل X رسالة من غير حساباتنا قبل ما يرسل الحساب التالي
+        return 3
     sp = [x["text"] for x in q("SELECT text FROM ag_msgs WHERE kind='special' AND enabled=1 ORDER BY id")]
     if not sp:
         await notify("⚠️ ماكو كلائش مخصصة. أضف من: الجروبات المخصصة ← الكلائش.", "nosp")
@@ -1359,6 +1383,7 @@ async def ag_tick_special(g):
     st["next_ts"] = t + (gap * random.uniform(0.8, 1.2) if ok else 3)
     if ok:
         st["last_sent"] = t
+        st["gap"] = 0  # نبدأ العد من جديد بعد رسالتنا
     return 1
 
 
@@ -1403,17 +1428,17 @@ def counts(since, acc=None):
 
 
 def fmt(d):
-    return f"📨 نشر: {d['tag']} رسالة ({d['tagp']} تاك) | 🔁 جروبات: {d['auto']} | 💬 ردود: {d['kw']} | ❌ فشل: {d['fail']}"
+    return f"🔁 جروبات: {d['auto']} | 💬 ردود: {d['kw']} | ❌ فشل: {d['fail']}"
 
 
 def stats_text():
     t0 = day_start()
     n_acc = q1("SELECT COUNT(*) c FROM accounts")["c"]
-    n_chat = q1("SELECT COUNT(*) c FROM chats WHERE enabled=1")["c"]
-    n_users = q1("SELECT COUNT(DISTINCT user_id) c FROM users")["c"]
+    n_chat = q1("SELECT COUNT(*) c FROM agroups WHERE enabled=1")["c"]
     out = [f"📊 الإحصائيات\n",
            f"🟢 حسابات شغالة: {len(RUNNERS)}/{n_acc} | 📂 مجموعات فعالة: {n_chat}",
-           f"👥 أعضاء معروفين: {n_users} | 📨 رسائل نشر: {q1('SELECT COUNT(*) c FROM messages WHERE enabled=1')['c']}"
+           f"📝 كلائش تلقائية: {q1('SELECT COUNT(*) c FROM ag_msgs WHERE kind=?', 'auto')['c']}"
+           f" | 🎭 مخصصة: {q1('SELECT COUNT(*) c FROM ag_msgs WHERE kind=?', 'special')['c']}"
            f" | 🔑 قواعد: {q1('SELECT COUNT(*) c FROM rules WHERE enabled=1')['c']}\n",
            f"📅 اليوم:\n{fmt(counts(t0))}",
            f"🗓 آخر 7 أيام:\n{fmt(counts(t0 - 6 * 86400))}",
@@ -1444,7 +1469,7 @@ def stats_text():
     if top:
         out.append("\n🏆 أنشط المجموعات اليوم:")
         for x in top:
-            c = q1("SELECT title FROM chats WHERE chat_id=?", x["chat_id"])
+            c = q1("SELECT title FROM agroups WHERE chat_id=?", x["chat_id"])
             out.append(f"• {c['title'] if c else x['chat_id']}: {x['c']}")
     errs = q("SELECT err, COUNT(*) c FROM log WHERE ts>=? AND ok=0 GROUP BY err ORDER BY c DESC LIMIT 5", t0)
     if errs:
@@ -1456,6 +1481,7 @@ def stats_text():
 def cleanup():
     ex("DELETE FROM log WHERE ts<?", now() - 90 * 86400)
     ex("DELETE FROM cooldowns WHERE ts<?", now() - 3 * 86400)
+    ex("DELETE FROM kw_hist WHERE ts<?", now() - 86400)
     ex("DELETE FROM replied WHERE rowid IN (SELECT rowid FROM replied ORDER BY rowid DESC LIMIT -1 OFFSET 20000)")
 
 
@@ -1522,7 +1548,7 @@ def B(label, data):
 
 def main_menu():
     p = "🟢" if S("power") else "🔴"
-    return [[B("👤 الحسابات", "accs"), B("📨 رسائل النشر", "msgs")],
+    return [[B("👤 الحسابات", "accs")],
             [B("🔑 الكلمات والردود", "rules"), B("📊 الإحصائيات", "stats")],
             [B("🔁 الجروبات التلقائية", "aglist:auto"), B("⭐ الجروبات المخصصة", "aglist:special")],
             [B("⚙️ الإعدادات", "sets"), B(f"{p} تشغيل/إيقاف الكل", "power")],
@@ -1546,23 +1572,23 @@ async def v_main(ev):
 
 async def v_accs(ev):
     rows = q("SELECT * FROM accounts")
-    btns = [[B(f"{tick(a['enabled'] and a['id'] in RUNNERS)} {a['name'] or ''} {a['phone']}", f"acc:{a['id']}")] for a in rows]
+    btns = [[B(f"{tick(a['enabled'] and a['id'] in RUNNERS)}{'🔗' if a['source'] == 'strat' else ''} {a['name'] or ''} {a['phone']}", f"acc:{a['id']}")] for a in rows]
     btns += [[B("➕ إضافة حساب", "accadd")], [B("🔙 رجوع", "main")]]
-    await ui(ev, f"👤 الحسابات ({len(rows)})\nكل حساب له مجموعاته الخاصة.", btns)
+    n_strat = sum(1 for a in rows if a["source"] == "strat")
+    await ui(ev, f"👤 الحسابات ({len(rows)}) | يدوي: {len(rows) - n_strat} | 🔗 من Strat: {n_strat}\nالجروبات تنضاف من (الجروبات التلقائية/المخصصة) وكل الحسابات تنضم لها.", btns)
 
 
 async def v_acc(ev, i):
     a = q1("SELECT * FROM accounts WHERE id=?", i)
     if not a:
         return await v_accs(ev)
-    n = q1("SELECT COUNT(*) c FROM chats WHERE account_id=?", i)["c"]
+    n = q1("SELECT COUNT(*) c FROM ag_members WHERE account_id=? AND status='joined'", i)["c"]
     r = RUNNERS.get(i)
     st = "🟢 شغال" if r else ("⛔ متوقف" if not a["enabled"] else "🔴 غير متصل")
     if r and time.time() < r.paused_until:
         st += f" (⏳ موقوف مؤقتاً {int(r.paused_until - time.time()) // 60 + 1} د)"
-    txt = f"👤 {a['name'] or ''}\n📱 {a['phone']}\nالحالة: {st}\n📂 المجموعات: {n}\n\n{fmt(counts(day_start(), i))}"
-    btns = [[B("📂 المجموعات / القنوات", f"chats:{i}")],
-            [B("🧹 تنظيف غير المضاف", f"accclean:{i}")],
+    txt = f"👤 {a['name'] or ''}\n📱 {a['phone']}\nالحالة: {st}\n📂 منضم لـ {n} جروب\n\n{fmt(counts(day_start(), i))}"
+    btns = [[B("🧹 تنظيف غير المضاف", f"accclean:{i}")],
             [B("⏸ إيقاف" if a["enabled"] else "▶️ تشغيل", f"acctog:{i}"), B("🗑 حذف", f"accdel:{i}")],
             [B("🔙 رجوع", "accs")]]
     await ui(ev, txt, btns)
@@ -1648,6 +1674,7 @@ AG_INFO = {
              "وبشرط ما تنرسل إلا بعد وصول عدد معين من رسائل الغرباء بين رسالتنا والتالية. "
              "الجروب المتأخر ينهمل مؤقتاً."),
     "special": ("جروب يبقى يتفاعل بيه البوت دائماً: الحسابات ترسل بالتناوب وبفاصل تحدده لكل جروب، "
+                "وبشرط وصول عدد معين من رسائل الغرباء (افتراضي 10) بين حساب وحساب، "
                 "وكل حساب مربوط بكليشة وحدة ثابتة."),
 }
 
@@ -1671,7 +1698,7 @@ async def v_ag(ev, gid):
     st = ag_st(gid)
     kind = g["kind"]
     lines = [f"{AG_TITLE[kind][:2]} {g['title'] or g['link']}", f"🔗 {g['link']}",
-             f"النوع: {'خاص' if g['access'] == 'private' else 'عام'} | الحالة: {tick(g['enabled'])}",
+             f"النوع: {'📁 من مجلد' if g['folder'] else ('خاص' if g['access'] == 'private' else 'عام')} | الحالة: {tick(g['enabled'])}",
              f"👤 منضم: {m['joined']} | ⏳ بانتظار قبول الإدارة: {m['requested']} | "
              f"🕓 بانتظار الانضمام: {m['pending']} | ❌ فشل: {m['failed']}"]
     if kind == "auto":
@@ -1679,7 +1706,8 @@ async def v_ag(ev, gid):
         if st["stale"]:
             lines.append("⏸ الجروب منهمل حالياً (متأخر)")
     else:
-        lines.append(f"⏱ الفاصل بين حساب وحساب: ~{g['gap_s']} ثانية")
+        lines.append(f"⏱ الفاصل الزمني بين حساب وحساب: ~{g['gap_s']} ثانية")
+        lines.append(f"📶 رسائل غرباء منذ آخر رسالة لنا: {st['gap']}/{S('special_gap_msgs')}")
     if st["last_sent"]:
         lines.append(f"🕒 آخر رسالة: قبل {int(time.time() - st['last_sent'])} ثانية")
     if g["chat_id"]:
@@ -1897,7 +1925,7 @@ async def on_cb(ev):
     elif c == "agadd" and a in AG_KINDS:
         STATE[uid] = {"step": "ag_add", "kind": a}
         await ui(ev, "➕ ارسل رابط/روابط الجروبات (عامة: @يوزر أو t.me/xxx ، خاصة: t.me/+xxxx) "
-                     "تكدر ترسل عدة روابط مرة وحدة.\n\nكل حساباتك راح تنضم تلقائياً (بفاصل بين كل انضمام). "
+                     "او رابط مجلد (t.me/addlist/xxxx) وينضم لكل جروباته. تكدر ترسل عدة روابط مرة وحدة.\n\nكل حساباتك راح تنضم تلقائياً (بفاصل بين كل انضمام). "
                      "الجروبات الخاصة اللي تحتاج موافقة، النشر يبدأ لحاله لما تنقبل الطلبات.\n\n(/cancel للإلغاء)")
     elif c == "agv" and i:
         await v_ag(ev, i)
@@ -1971,7 +1999,7 @@ async def finish_login(ev, uid, c):
         aid = ex("INSERT INTO accounts(phone,name,user_id,session,added_ts) VALUES(?,?,?,?,?)", phone, name, me.id, sess, now()).lastrowid
     ok = await start_runner(aid)
     await ev.respond(f"✅ تمت إضافة الحساب {name} ({phone})\n{'🟢 شغال' if ok else '⚠️ تعذر التشغيل'}",
-                     buttons=[[B("📂 إضافة مجموعات", f"chats:{aid}")], [B("🏠 القائمة", "main")]])
+                     buttons=[[B("🔁 الجروبات", "aglist:auto")], [B("🏠 القائمة", "main")]])
 
 
 # ---------- استيراد تلقائي من بوت Strat (جلسة مستقلة لكل رقم) ----------
@@ -1983,6 +2011,7 @@ async def import_strat_session(phone, session_str):
         await c.connect()
         if not await c.is_user_authorized():
             log.warning("strat session for %s not authorized", phone)
+            await notify(f"⚠️ جلسة Strat للرقم {phone} غير صالحة (مو مسجل دخول).", f"stratbad{phone}")
             return False
         me = await c.get_me()
         name = utils.get_display_name(me)
@@ -1995,16 +2024,21 @@ async def import_strat_session(phone, session_str):
         except Exception:
             pass
 
-    old = q1("SELECT id FROM accounts WHERE user_id=? OR phone=?", me.id, phone)
+    old = q1("SELECT id, session, enabled FROM accounts WHERE user_id=? OR phone=?", me.id, phone)
     if old:
-        ex("UPDATE accounts SET session=?, enabled=1, name=?, phone=? WHERE id=?",
-           session_str, name, phone, old["id"])
         aid = old["id"]
+        if old["session"] == session_str and aid in RUNNERS:
+            return True  # نفس الجلسة وشغالة: لا إعادة تشغيل ولا إشعار مكرر كل دورة سحب
+        if old["session"] == session_str and not old["enabled"]:
+            return True  # أوقفته يدوياً: ما نرجع نشغله
+        ex("UPDATE accounts SET session=?, enabled=1, name=?, phone=? WHERE id=?", session_str, name, phone, aid)
+        new = False
     else:
-        aid = ex("INSERT INTO accounts(phone,name,user_id,session,added_ts) VALUES(?,?,?,?,?)",
-                  phone, name, me.id, session_str, now()).lastrowid
-    ok = await start_runner(aid)
-    await notify(f"🔗 استُلمت جلسة مستقلة من Strat للرقم {phone} ({name})\n"
+        aid = ex("INSERT INTO accounts(phone,name,user_id,session,added_ts,source) VALUES(?,?,?,?,?,'strat')",
+                 phone, name, me.id, session_str, now()).lastrowid
+        new = True
+    ok = await start_runner(aid)  # يسجّله بقائمة الحسابات وينضم تلقائياً لكل الجروبات المضافة، مثل اليدوي
+    await notify(f"🔗 {'انضاف' if new else 'انحدّثت جلسة'} الحساب {phone} ({name}) من Strat وصار ضمن قائمة الحسابات\n"
                  f"{'🟢 شغال' if ok else '⚠️ تعذر التشغيل'}")
     return True
 
@@ -2393,6 +2427,10 @@ async def on_text(ev):
         refs = [x for x in re.split(r"[\s,،]+", txt) if x][:50]
         lines = []
         for ref in refs:
+            fm = re.search(r"(?:t|telegram)\.me/addlist/([\w-]+)|tg://addlist\?slug=([\w-]+)", ref)
+            if fm:
+                lines += await ag_add_folder(kind, fm.group(1) or fm.group(2))
+                continue
             k, val = parse_ref(ref)
             if k not in ("invite", "user"):
                 lines.append(f"❌ {ref}: لازم رابط دعوة أو @يوزر")
@@ -2401,7 +2439,7 @@ async def on_text(ev):
             if q1("SELECT id FROM agroups WHERE hash=? OR lower(uname)=?", h or "~", (u or "~").lower()):
                 lines.append(f"⚠️ {ref}: مضاف من قبل")
                 continue
-            gid = ex("INSERT INTO agroups(kind,link,hash,uname,access,title) VALUES(?,?,?,?,?,?)",
+            gid = ex("INSERT INTO agroups(kind,link,hash,uname,access,title,gap_s) VALUES(?,?,?,?,?,?,60)",
                      kind, ref, h, u, "private" if h else "public", ref).lastrowid
             ag_sync_group(gid)
             ag_start(gid)
