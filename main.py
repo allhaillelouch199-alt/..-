@@ -38,6 +38,10 @@ API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(i) for i in re.findall(r"\d+", os.getenv("ADMIN_IDS", ""))}
 DB_PATH = os.getenv("DB_PATH", os.path.join(HERE, "autoposter.db"))
+# ربط بوت Strat: يسحب منه جلسات مستقلة (جهاز ثانٍ) جاهزة لكل رقم تلقائياً.
+STRAT_API_URL = os.getenv("STRAT_API_URL", "").rstrip("/")
+STRAT_API_KEY = os.getenv("STRAT_API_KEY", "")
+STRAT_POLL_SECONDS = int(os.getenv("STRAT_POLL_SECONDS") or 30)
 
 if not (API_ID and API_HASH and BOT_TOKEN and ADMIN_IDS):
     print("❌ عبّي API_ID و API_HASH و BOT_TOKEN و ADMIN_IDS بملف .env")
@@ -1242,6 +1246,92 @@ async def finish_login(ev, uid, c):
                      buttons=[[B("📂 إضافة مجموعات", f"chats:{aid}")], [B("🏠 القائمة", "main")]])
 
 
+# ---------- استيراد تلقائي من بوت Strat (جلسة مستقلة لكل رقم) ----------
+async def import_strat_session(phone, session_str):
+    """يسجّل جلسة مستقلة وصلت من Strat كحساب جديد (جهاز ثانٍ منفصل)، أو
+    يحدّث حساباً موجوداً بنفس الرقم إن وُجد."""
+    c = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    try:
+        await c.connect()
+        if not await c.is_user_authorized():
+            log.warning("strat session for %s not authorized", phone)
+            return False
+        me = await c.get_me()
+        name = utils.get_display_name(me)
+    except Exception as e:
+        log.warning("strat session for %s failed: %s", phone, e)
+        return False
+    finally:
+        try:
+            await c.disconnect()
+        except Exception:
+            pass
+
+    old = q1("SELECT id FROM accounts WHERE user_id=? OR phone=?", me.id, phone)
+    if old:
+        ex("UPDATE accounts SET session=?, enabled=1, name=?, phone=? WHERE id=?",
+           session_str, name, phone, old["id"])
+        aid = old["id"]
+    else:
+        aid = ex("INSERT INTO accounts(phone,name,user_id,session) VALUES(?,?,?,?)",
+                  phone, name, me.id, session_str).lastrowid
+    ok = await start_runner(aid)
+    await notify(f"🔗 استُلمت جلسة مستقلة من Strat للرقم {phone} ({name})\n"
+                 f"{'🟢 شغال' if ok else '⚠️ تعذر التشغيل'}")
+    return True
+
+
+async def strat_poll_once():
+    import json as _json
+    import urllib.request as _ur
+    import urllib.error as _ue
+
+    req = _ur.Request(
+        f"{STRAT_API_URL}/partner/external-sessions",
+        headers={"X-Partner-Key": STRAT_API_KEY},
+    )
+    try:
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(None, lambda: _ur.urlopen(req, timeout=20).read())
+    except _ue.HTTPError as e:
+        if e.code != 403:
+            log.warning("strat poll http error: %s", e)
+        else:
+            log.error("strat poll forbidden — تحقق من STRAT_API_KEY")
+        return
+    except Exception as e:
+        log.warning("strat poll failed: %s", e)
+        return
+
+    try:
+        data = _json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        log.warning("strat poll bad json: %s", e)
+        return
+
+    for item in data.get("sessions") or []:
+        phone = (item.get("phone_number") or "").strip()
+        sess = item.get("session_string") or ""
+        if not phone or not sess:
+            continue
+        try:
+            await import_strat_session(phone, sess)
+        except Exception as e:
+            log.warning("import_strat_session(%s) failed: %s", phone, e)
+
+
+async def strat_poll_loop():
+    if not (STRAT_API_URL and STRAT_API_KEY):
+        log.info("STRAT_API_URL/STRAT_API_KEY غير مضبوطين — تعطيل استيراد جلسات Strat")
+        return
+    while True:
+        try:
+            await strat_poll_once()
+        except Exception as e:
+            log.warning("strat_poll_loop: %s", e)
+        await asyncio.sleep(STRAT_POLL_SECONDS)
+
+
 def parse_ref(ref):
     ref = ref.strip()
     m = (re.search(r"(?:t|telegram)\.me/(?:joinchat/|\+)([\w-]+)", ref)
@@ -1572,6 +1662,7 @@ async def main():
     for a in q("SELECT id FROM accounts WHERE enabled=1"):
         await start_runner(a["id"])
     asyncio.create_task(report_loop())
+    asyncio.create_task(strat_poll_loop())
     await notify(f"🟢 البوت اشتغل. حسابات شغالة: {len(RUNNERS)}\nاكتب /start")
     log.info("bot ready")
     await bot.run_until_disconnected()
